@@ -5,7 +5,7 @@ Browse, inspect, and resume your [Claude Code](https://docs.anthropic.com/en/doc
 Claude Code saves every session as a JSONL transcript under `~/.claude/projects/`. Closing a terminal tab loses nothing — but *recalling* what each session was, and jumping back into the right one, is the hard part. `ccpeek` is that recall layer:
 
 ```
- 10:59  letz-app        32   143k  can you add retry logic to the webhook handler?
+ 10:59  my-app          32   143k  can you add retry logic to the webhook handler?
  10:35  dashboards      19   109k  I'm not entirely sure that's the picture. Can you pull…
  10:04  infra            4    37k  create a new keypair and give me the pubkey
  Jul-13 blog             2    23k  hi, can u scp this over to my downloads folder?
