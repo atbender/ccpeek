@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# ccpeek — browse & resume Claude Code sessions; preview shows where you left off.
+#
+#   ccpeek          all projects, newest first
+#   ccpeek -l | .   only sessions started in the current dir
+#   ccpeek --list   print the index as plain TSV (date, project, last-msg, cwd, id, path)
+#
+# keys: enter=resume   ctrl-o=full transcript   ctrl-y=copy session id   ctrl-/=preview
+set -euo pipefail
+D="$HOME/.claude/projects"
+CACHE="$HOME/.cache/ccpeek-index.json"
+
+# --- transcript renderer ------------------------------------------------------
+#   --tail   <path>  header + last user request -> last reply (preview pane)
+#   --render <path>  whole conversation, tool noise collapsed (ctrl-o pager)
+if [[ "${1:-}" == "--tail" || "${1:-}" == "--render" ]]; then
+  python3 - "$1" "$2" <<'PY'
+import sys, json, time, os, re
+mode, path = sys.argv[1], sys.argv[2]
+events=[]; pend=0; first=""; n=0; cwd=""; usage=None
+for line in open(path, encoding="utf-8", errors="replace"):
+    try: o=json.loads(line)
+    except: continue
+    if not cwd and o.get("cwd"): cwd=o["cwd"]
+    if o.get("type") not in ("user","assistant") or o.get("isMeta") or o.get("isSidechain"):
+        continue
+    if o["type"]=="assistant":
+        u=(o.get("message") or {}).get("usage")
+        if u and u.get("cache_read_input_tokens") is not None: usage=u
+    c=o.get("message",{}).get("content")
+    parts = c if isinstance(c,list) else [{"type":"text","text":c or ""}]
+    text=[]
+    for p in parts:
+        if not isinstance(p,dict): continue
+        if p.get("type")=="text": text.append(p.get("text",""))
+        else: pend+=1                      # tool_use / tool_result / thinking
+    b="\n".join(text).strip()
+    if not b or b.startswith("<") or "command-name" in b[:60] or "caveat:" in b[:60].lower():
+        continue
+    who="you" if o["type"]=="user" else "cc "
+    if who=="you" and not first: first=b
+    if pend: events.append((None,pend)); pend=0
+    events.append((who,b))
+if pend: events.append((None,pend))
+prev=None
+for w,_ in events:                 # same-side runs count once
+    if w is None: continue
+    if w!=prev: n+=1; prev=w
+
+DIM="\033[2m"; R="\033[0m"; B="\033[1m"
+W=int(os.environ.get("FZF_PREVIEW_COLUMNS") or 72)     # fit header to pane width
+sid=os.path.basename(path)[:-6]
+mt=time.strftime("%b-%d %H:%M", time.localtime(os.stat(path).st_mtime))
+tok=""
+if usage:
+    ctx=sum(usage.get(k,0) or 0 for k in
+        ("input_tokens","cache_read_input_tokens","cache_creation_input_tokens","output_tokens"))
+    tcol="\033[1;32m" if ctx<200_000 else "\033[1;33m" if ctx<600_000 else "\033[1;31m"
+    tok=f"{DIM} · {R}{tcol}{round(ctx/1000)}k tok{R}"
+opened=" ".join(first.split())
+if len(opened)>W-7: opened=opened[:W-8]+"…"
+last_you=next((b for w,b in reversed(events) if w=="you"), "")
+last_you=" ".join(last_you.split())
+if len(last_you)>W-7: last_you=last_you[:W-8]+"…"
+print(f"{DIM}  id  {R}{sid[:8]}{DIM} · {os.path.basename(cwd) or '?'}{R}")
+print(f"{DIM}last  {mt} · {R}\033[1;36m{n} msgs{R}{tok}")
+print(f"{DIM}open  {opened}{R}")
+print(f"\033[1;36m you  {R}{last_you or '—'}")
+print(f"{DIM}{'─'*max(20,W-2)}{R}\n")
+
+def style(line):                                   # inline markdown -> ANSI
+    line=re.sub(r"\*\*(.+?)\*\*", "\033[1m\\1\033[22m", line)
+    line=re.sub(r"(?<!`)`([^`]+)`(?!`)", "\033[38;5;180m\\1\033[39m", line)
+    return line
+
+def emit(who,b,cap,maxl=0):
+    if who is None:
+        print(f"{DIM}    ⋯ {b} tool/think step{'s' if b>1 else ''}{R}\n"); return
+    if len(b)>cap: b=b[:cap].rstrip()+" …"
+    lines=[]; fence=False; blank=False
+    for raw in b.splitlines():
+        line=raw.rstrip(); s=line.strip()
+        if not s:                                   # squeeze runs of blank lines
+            if lines and not blank: lines.append("")
+            blank=True; continue
+        blank=False
+        if s.startswith("```"):
+            fence=not fence; lines.append(f"{DIM}{line}{R}"); continue
+        if fence:
+            lines.append(f"\033[38;5;151m{line}{R}"); continue
+        m=re.match(r"^#{1,6}\s+(.*)",s)
+        if m:                                       # heading
+            lines.append(f"\033[1;33m{m.group(1)}{R}"); continue
+        if "|" in s and "-" in s and re.fullmatch(r"[|\s:-]+", s):
+            lines.append(f"{DIM}{line}{R}"); continue   # table separator row
+        lines.append(style(line))
+    while lines and not lines[-1]: lines.pop()
+    if maxl and len(lines)>maxl:
+        cut=len(lines)-maxl
+        lines=lines[:maxl]+[f"{DIM}… (+{cut} more lines){R}"]
+    body="\n    ".join(lines)                       # continuation under label
+    col="\033[1;36m" if who=="you" else "\033[1;35m"
+    print(f"{col}{who}{R} {body}\n")
+
+if mode=="--render":
+    for who,b in events: emit(who,b,1600)
+else:
+    # last user request -> (collapsed middle) -> final reply
+    li=max((i for i,(w,_) in enumerate(events) if w=="you"), default=None)
+    if li is None:
+        for who,b in events[-3:]: emit(who,b,900)
+    else:
+        tail=events[li:]
+        emit("you", tail[0][1], 500, maxl=6)
+        mid=tail[1:]
+        # keep only the final cc text; collapse everything between
+        last_cc=max((i for i,(w,_) in enumerate(mid) if w=="cc "), default=None)
+        steps=sum(x for w,x in mid[:last_cc if last_cc is not None else len(mid)] if w is None)
+        replies=sum(1 for w,_ in mid[:last_cc or 0] if w=="cc ")
+        if steps or replies:
+            bits=[f"{steps} tool/think step{'s'*(steps!=1)}"] if steps else []
+            if replies: bits.append(f"{replies} earlier repl{'ies' if replies!=1 else 'y'}")
+            print(f"{DIM}    ⋯ {' · '.join(bits)}{R}\n")
+        if last_cc is not None: emit("cc ", mid[last_cc][1], 1400)
+PY
+  exit 0
+fi
+
+# --- args ---------------------------------------------------------------------
+only=""; plain=""
+case "${1:-}" in
+  .|-l|--local) only="$(pwd)";;
+  --list)       plain=1;;
+esac
+
+# --- index (mtime-cached: only changed transcripts are re-parsed) --------------
+index() {
+  python3 - "$D" "$only" "$CACHE" "$plain" <<'PY'
+import os, sys, glob, json, time
+root, only, cachep, plain = sys.argv[1:5]
+try: cache=json.load(open(cachep))
+except Exception: cache={}
+def parse(f):
+    cwd=""; last=""; n=0; ctx=0; prev=None
+    for line in open(f, encoding="utf-8", errors="replace"):
+        try: o=json.loads(line)
+        except: continue
+        if not cwd and o.get("cwd"): cwd=o["cwd"]
+        t=o.get("type")
+        if t not in ("user","assistant") or o.get("isMeta") or o.get("isSidechain"):
+            continue
+        if t=="assistant":
+            u=(o.get("message") or {}).get("usage")
+            if u and u.get("cache_read_input_tokens") is not None:
+                ctx=sum(u.get(k,0) or 0 for k in ("input_tokens",
+                    "cache_read_input_tokens","cache_creation_input_tokens","output_tokens"))
+        c=o.get("message",{}).get("content")
+        if isinstance(c,list):
+            c=" ".join(p.get("text","") for p in c if isinstance(p,dict) and p.get("type")=="text")
+        if not isinstance(c,str): continue
+        c=c.strip()
+        if not c or c.startswith("<") or "command-name" in c[:60] or "caveat:" in c[:60].lower():
+            continue
+        # a run of same-side messages = one turn (user,cc,user,cc -> 4)
+        if t!=prev: n+=1; prev=t
+        if t=="user": last=" ".join(c.split())
+    return {"cwd":cwd, "last":last[:150], "n":n, "ctx":ctx, "v":2}
+rows=[]; seen={}
+for f in glob.glob(os.path.join(root,"*","*.jsonl")):
+    mt=os.stat(f).st_mtime
+    e=cache.get(f)
+    if not e or e.get("mt")!=mt or e.get("v")!=2:
+        e=parse(f); e["mt"]=mt
+    seen[f]=e
+    if only and e["cwd"]!=only: continue
+    rows.append((mt,e,f))
+try:
+    os.makedirs(os.path.dirname(cachep), exist_ok=True)
+    json.dump(seen, open(cachep,"w"))
+except Exception: pass
+rows.sort(key=lambda r:-r[0])
+today=time.strftime("%Y%m%d")
+for mt,e,f in rows:
+    lt=time.localtime(mt)
+    d = time.strftime("%H:%M",lt) if time.strftime("%Y%m%d",lt)==today else time.strftime("%b-%d",lt)
+    proj=os.path.basename(e["cwd"]) if e["cwd"] else "?"
+    hint=e["last"] or "· empty ·"
+    sid=os.path.basename(f)[:-6]
+    n=e.get("n",0); ctx=e.get("ctx",0)
+    tk=f"{round(ctx/1000)}k" if ctx else "–"
+    if plain:
+        print(f"{d}\t{proj}\t{n}\t{tk}\t{hint}\t{e['cwd']}\t{sid}\t{f}")
+    else:
+        if len(proj)>12: proj=proj[:11]+"…"
+        tcol="\033[1;32m" if ctx<200_000 else "\033[1;33m" if ctx<600_000 else "\033[1;31m"
+        print(f"\033[2m{d:>6}\033[0m \t\033[36m{proj:<12}\033[0m \t\033[1;36m{n:>4}\033[0m \t{tcol}{tk:>5}\033[0m \t{hint}\t{e['cwd']}\t{sid}\t{f}")
+PY
+}
+
+[[ -n "$plain" ]] && { index; exit 0; }
+
+# in local mode the project column is redundant — give its width to the hint
+WITH='1,2,3,4,5'; [[ -n "$only" ]] && WITH='1,3,4,5'
+
+sel="$(index | fzf --ansi --delimiter='\t' --with-nth="$WITH" --tabstop=1 \
+  --no-sort --tiebreak=index --prompt='❯ ' --info=inline-right \
+  --header='enter resume · ^j/^k scroll chat · ^o pager · ^y copy id · ^/ preview' \
+  --preview="$0 --render {8}" \
+  --preview-window='right,55%,wrap,border-left,~6,follow' \
+  --bind='ctrl-/:toggle-preview' \
+  --bind='ctrl-k:preview-up,ctrl-j:preview-down' \
+  --bind='shift-up:preview-half-page-up,shift-down:preview-half-page-down' \
+  --bind="ctrl-o:execute($0 --render {8} | less -R)" \
+  --bind='ctrl-y:execute-silent(printf %s {7} | pbcopy)')" || exit 0
+
+cwd="$(printf '%s' "$sel"|cut -f6)"; sid="$(printf '%s' "$sel"|cut -f7)"
+[[ -z "$sid" ]] && exit 0
+cd "$cwd" 2>/dev/null || { echo "gone: $cwd"; exit 1; }
+exec claude --resume "$sid"
