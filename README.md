@@ -15,7 +15,7 @@ Claude Code saves every session as a JSONL transcript under `~/.claude/projects/
 
 - **List**: every session across all projects, newest first — date, project, dialogue turns, context tokens (green/yellow/red as it approaches compaction), and the last thing you typed.
 - **Preview**: the *bottom* of the conversation — your last request and the assistant's final reply — with a pinned header (session id, turn count, token size, opening prompt, last request). Scroll up through the whole chat. Markdown renders properly: tables, headings, bold, code. Tool-call noise collapses into `⋯ 7 tool/think steps`.
-- **Enter**: `cd`s to the session's project directory and runs `claude --resume` — you're back in the conversation with full context.
+- **Enter**: `cd`s to the session's project directory and runs `claude --resume` — you're back in the conversation with full context. Inside tmux, a session belonging to another project opens in *that* project's tmux session (see below).
 
 ## Install
 
@@ -65,6 +65,20 @@ bind-key v new-window -n peek "~/.local/bin/ccpeek"
 # only the current project's sessions
 bind-key C-v new-window -c "#{pane_current_path}" -n peek "~/.local/bin/ccpeek -l"
 ```
+
+### One tmux session per project
+
+If you keep a tmux session per project (à la [tmux-sessionizer](https://github.com/ThePrimeagen/.dotfiles)), a session you pick while browsing *all* projects belongs in that project's tmux session — not in whatever window you happened to press the key from. Set `CCPEEK_ROOTS` to where your projects live (colon-separated dirs or globs, `~` allowed) to turn that on:
+
+```tmux
+set-environment -g CCPEEK_ROOTS "~/dotfiles:~/src/*"
+```
+
+Then picking a session from another project creates that project's tmux session if it isn't running, opens Claude in a new window there, and switches you to it. Picking one from the project you're already in takes over the peek window as before. Unset — the default — every pick just takes over the window.
+
+The session is named after the project *root*, since a transcript's cwd is often a subdir of it (`~/src/app/packages/api` → session `app`, window `api`). ccpeek finds the root via the `CCPEEK_ROOTS` entry containing the cwd, falling back to the git toplevel — which matters for nested repos, where the git toplevel alone would give the inner repo a session of its own.
+
+Note `CCPEEK_ROOTS` has to reach a *non-interactive* shell, so `.zshrc`/`.bashrc` won't do it — use tmux's `set-environment` as above, or `.zshenv`.
 
 ## How it works
 
